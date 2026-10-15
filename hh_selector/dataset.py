@@ -140,6 +140,28 @@ def _algo_succeeded(arrays, method: str, cfg: CFG) -> np.ndarray:
         return ok
     raise ValueError(method)
 
+
+def _semi_truth_helper(arrays,invert:bool,cfg) -> np.ndarray:
+    sentinel = cfg.truth_sentinel
+    ok = np.ones(len(arrays), dtype=bool)
+    if not invert:
+        for br in cfg.semiresolved_truth_branches:
+            ok &= ak.to_numpy(arrays[br]) != sentinel
+        ok &= (
+            ak.to_numpy(arrays.truerecoj_H2b1_index)
+            != ak.to_numpy(arrays.truerecoj_H2b2_index)
+        )
+        return ok
+    else:
+        for br in cfg.inverted_semiresolved_truth_branches:
+            ok &= ak.to_numpy(arrays[br]) != sentinel
+        ok &= (
+            ak.to_numpy(arrays.truerecoj_H1b1_index)
+            != ak.to_numpy(arrays.truerecoj_H1b2_index)
+        )
+        return ok
+        
+
 def _algo_truth_correct(arrays, method: str, cfg: CFG) -> np.ndarray:
     """Layer 2: did the pairing algorithm produce a valid assignment?"""
     sentinel = cfg.truth_sentinel
@@ -157,12 +179,9 @@ def _algo_truth_correct(arrays, method: str, cfg: CFG) -> np.ndarray:
         ok &= (i2 != i3)
         return ok
     if method == "semiresolved":
-        ok = np.ones(len(arrays), dtype=bool)
-        for br in cfg.semiresolved_truth_branches:
-            ok &= ak.to_numpy(arrays[br]) != sentinel
-        ok &= (
-            ak.to_numpy(arrays.truerecoj_H2b1_index)
-            != ak.to_numpy(arrays.truerecoj_H2b2_index)
+        ok = (
+            _semi_truth_helper(arrays,True,cfg) |
+            _semi_truth_helper(arrays,False,cfg)
         )
         return ok
     if method == "merged":
@@ -179,7 +198,7 @@ def _algo_truth_correct(arrays, method: str, cfg: CFG) -> np.ndarray:
 
 # ── reco accuracy ─────────────────────────────────────────────────
 
-def _old_reco_accuracy_for_method(arrays, method: str, cfg: CFG):
+def _old1_reco_accuracy_for_method(arrays, method: str, cfg: CFG):
     """Return (mH1, mH2) arrays for one reconstruction method.
 
     Only valid for events where the algorithm succeeded (caller must mask).
@@ -242,7 +261,7 @@ def permute_s4_subgroup(a):
 
 
 
-def _reco_accuracy_for_method(arrays, method: str, cfg: CFG):
+def _old2_reco_accuracy_for_method(arrays, method: str, cfg: CFG):
     """Return (mH1, mH2) arrays for one reconstruction method.
 
     Only valid for events where the algorithm succeeded (caller must mask).
@@ -288,6 +307,70 @@ def _reco_accuracy_for_method(arrays, method: str, cfg: CFG):
         correct = (reco == truth).sum(axis=1,keepdims=True).max(axis=2).flatten().astype(float)
         
         return correct / 2
+
+
+def _reco_accuracy_for_method(arrays, method: str, cfg: CFG):
+    """Updated reco accuracy that accounts for both inverted and non-inverted semiresolved.
+
+    For resolved and merged, behaves identically to _reco_accuracy_for_method.
+    For semiresolved, computes accuracy for the non-inverted setup (H1 = fatjet)
+    and the inverted setup (H2 = fatjet) independently, using the event-wise max
+    as the final accuracy. Events where a particular setup is unavailable receive
+    a sentinel of -1.0 so the max never selects them.
+
+    Only valid for events where the algorithm succeeded (caller must mask).
+    """
+    if method == "resolved":
+        reco = np.array([arrays[recoidx].to_numpy() for recoidx in cfg.resolved_reco_branches]).astype(int).T
+        truth = np.array([arrays[truthidx].to_numpy() for truthidx in cfg.resolved_truth_branches]).astype(int).T
+        reco = permute_s4_subgroup(reco)
+        truth = np.broadcast_to(truth[:, :, np.newaxis], reco.shape)
+        correct = (reco == truth).sum(axis=1, keepdims=True).max(axis=2).flatten().astype(float)
+        return correct / 4.0
+
+    if method == "semiresolved":
+        N = len(arrays)
+        SENTINEL = -1.0
+
+        noninv_avail = _semi_truth_helper(arrays, False, cfg)
+        inv_avail = _semi_truth_helper(arrays, True, cfg)
+
+        acc_noninv = np.full(N, SENTINEL, dtype=float)
+        acc_inv = np.full(N, SENTINEL, dtype=float)
+
+        # non-inverted: fatjet ↔ H1 truth, resolved b's ↔ H2 truth
+        if noninv_avail.any():
+            sub = arrays[noninv_avail]
+            reco_b = np.array([sub[recoidx].to_numpy() for recoidx in cfg.semiresolved_reco_branches[1:]]).astype(int).T
+            truth_b = np.array([sub[truthidx].to_numpy() for truthidx in cfg.semiresolved_truth_branches[1:]]).astype(int).T
+            reco_b = np.stack([reco_b[:, (0, 1)], reco_b[:, (1, 0)]], axis=2)
+            truth_b = np.broadcast_to(truth_b[:, :, np.newaxis], reco_b.shape)
+            ak8_correct = (sub.semiHH_fatjet_index == sub.truerecofj_H1b1_index).to_numpy().astype(float)
+            ak4_correct = (reco_b == truth_b).sum(axis=1, keepdims=True).max(axis=2).flatten().astype(float)
+            acc_noninv[noninv_avail] = 0.25 * ak4_correct + 0.5 * ak8_correct
+
+        # inverted: fatjet ↔ H2 truth, resolved b's ↔ H1 truth
+        if inv_avail.any():
+            sub = arrays[inv_avail]
+            reco_b = np.array([sub[recoidx].to_numpy() for recoidx in cfg.semiresolved_reco_branches[1:]]).astype(int).T
+            truth_b = np.array([sub[truthidx].to_numpy() for truthidx in cfg.inverted_semiresolved_truth_branches[1:]]).astype(int).T
+            reco_b = np.stack([reco_b[:, (0, 1)], reco_b[:, (1, 0)]], axis=2)
+            truth_b = np.broadcast_to(truth_b[:, :, np.newaxis], reco_b.shape)
+            ak8_correct = (sub.semiHH_fatjet_index == sub.truerecofj_H2b1_index).to_numpy().astype(float)
+            ak4_correct = (reco_b == truth_b).sum(axis=1, keepdims=True).max(axis=2).flatten().astype(float)
+            acc_inv[inv_avail] = 0.25 * ak4_correct + 0.5 * ak8_correct
+
+        return np.maximum(acc_noninv, acc_inv)
+
+    if method == "merged":
+        reco = np.array([arrays[recoidx].to_numpy() for recoidx in cfg.merged_reco_branches]).astype(int).T
+        truth = np.array([arrays[truthidx].to_numpy() for truthidx in cfg.merged_truth_branches]).astype(int).T
+        reco = np.stack([reco[:, (0, 1)], reco[:, (1, 0)]], axis=2)
+        truth = np.broadcast_to(truth[:, :, np.newaxis], reco.shape)
+        correct = (reco == truth).sum(axis=1, keepdims=True).max(axis=2).flatten().astype(float)
+        return correct / 2
+
+
 # ── reconstructed Higgs features ───────────────────────────────────────────
 
 def compute_higgses(arrays, cfg: CFG,
@@ -377,7 +460,7 @@ def _compute_error(
         np.square(ptH2_best_weight * ((reco_ptH2 - gen_ptH2) / np.sqrt(np.square(reco_ptH2) + np.square(gen_ptH2)))) +
         np.square(deltaRH1_best_weight * (deltaRH1 / np.pi)) +
         np.square(deltaRH2_best_weight * (deltaRH2 / np.pi)) +
-        reco_accuracy_best_weight * (1.0 - reco_accuracy)
+        np.square(reco_accuracy_best_weight * (1.0 - reco_accuracy))
     )
 
 def _compute_targets(
@@ -566,17 +649,17 @@ def load_data(cfg: CFG, max_events: int | None = None):
     max_ak4 = max(len(a) for a in ak4_kept)
     max_ak8 = max(len(a) for a in ak8_kept)
 
-    ak4_pad = np.zeros((N, max_ak4, D4), dtype=np.float32)
-    ak8_pad = np.zeros((N, max_ak8, D8), dtype=np.float32)
-    ak4_mask = np.ones((N, max_ak4), dtype=bool)
-    ak8_mask = np.ones((N, max_ak8), dtype=bool)
-    for i in range(N):
-        n4 = len(ak4_kept[i])
-        ak4_pad[i, :n4] = np.asarray(ak4_kept[i], dtype=np.float32)
-        ak4_mask[i, :n4] = False
-        n8 = len(ak8_kept[i])
-        ak8_pad[i, :n8] = np.asarray(ak8_kept[i], dtype=np.float32)
-        ak8_mask[i, :n8] = False
+    ak4_masked = ak.to_numpy(
+        ak.pad_none(ak4_kept, max_ak4, axis=1), allow_missing=True,
+    )
+    ak4_pad = np.where(ak4_masked.mask, 0, ak4_masked.data).astype(np.float32)
+    ak4_mask = ak4_masked.mask.any(axis=-1)
+
+    ak8_masked = ak.to_numpy(
+        ak.pad_none(ak8_kept, max_ak8, axis=1), allow_missing=True,
+    )
+    ak8_pad = np.where(ak8_masked.mask, 0, ak8_masked.data).astype(np.float32)
+    ak8_mask = ak8_masked.mask.any(axis=-1)
 
     print(f"  after filtering: {N} events with ≥2 valid methods")
     print(f"  jet padding: max_ak4={max_ak4}, max_ak8={max_ak8}")

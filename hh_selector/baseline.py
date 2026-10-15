@@ -79,7 +79,7 @@ def get_btag_counts(arrays, event_indices, method_mask, method):
         return np.zeros(len(arrays[method_mask[:,2]]),dtype=float)
         
 
-def get_scores(method_mask, H1mass, H2mass, H1pt, H2pt, btags, basic_params_list : dict):
+def get_scores(method_mask, H1mass, H2mass, H1pt, H2pt, btags, baseline_params_list : dict):
     """
     Accepts 
         method_mask : (N, 3) bool, True where topology_possible & algo_succeeded, 
@@ -92,11 +92,11 @@ def get_scores(method_mask, H1mass, H2mass, H1pt, H2pt, btags, basic_params_list
     The score is based on the mass and pt of the reconstructed Higgs bosons, with the goal of minimizing the difference between the reconstructed pt and the expected mass of 125 GeV.
 
     """
-    H1m_w = basic_params_list['basic_mH1_weight']
-    H2m_w = basic_params_list['basic_mH2_weight']
+    H1m_w = baseline_params_list['baseline_mH1_weight']
+    H2m_w = baseline_params_list['baseline_mH2_weight']
 
-    dpt_w_arr = np.array(basic_params_list['basic_dpt_weight'])
-    btag_weight = np.array(basic_params_list['basic_btag_weight'])
+    dpt_w_arr = np.array(baseline_params_list['baseline_dpt_weight'])
+    btag_weight = np.array(baseline_params_list['baseline_btag_weight'])
     
     error = np.abs(2 * 125.0 - H1mass * H1m_w - H2mass * H2m_w)
     error += np.abs(H1pt - H2pt) * dpt_w_arr[np.newaxis, :]
@@ -109,10 +109,10 @@ def get_scores(method_mask, H1mass, H2mass, H1pt, H2pt, btags, basic_params_list
     
 
     
-def apply_basicsort(ev: ak.Array,
+def apply_baseline(ev: ak.Array,
                 cfg: CFG = CFG(),
                 min_methods: int = 1,
-                basic_params_list: dict = CFG().basic_params_list
+                baseline_params_list: dict = CFG().baseline_params_list
     ):
     methods = ["resolved", "semiresolved", "merged"]
     d = {
@@ -171,7 +171,7 @@ def apply_basicsort(ev: ak.Array,
         H2pt[method_mask[:,j], j] = h2.pt.to_numpy()
         btags[method_mask[:,j], j] = get_btag_counts(arrays, event_indices, method_mask, method)
 
-    scores = get_scores(method_mask, H1mass, H2mass, H1pt, H2pt, btags, basic_params_list)
+    scores = get_scores(method_mask, H1mass, H2mass, H1pt, H2pt, btags, baseline_params_list)
 
     return SorterResult(
         scores=scores,

@@ -187,7 +187,10 @@ def load_model(checkpoint_path: str | Path, cfg: CFG,
         dropout=cfg.dropout,
     )
     state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state["model_state_dict"])
+    sd = state["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in sd):
+        sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
+    model.load_state_dict(sd)
     model.to(device).eval()
     return model
 

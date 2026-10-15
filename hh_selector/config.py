@@ -5,7 +5,7 @@ from pathlib import Path
 @dataclass
 class CFG:
     # ── paths ────────────────────────────────────────────────────────────
-    data_dir: Path = Path("/home/kirchee/ATLAS/more_signal")
+    data_dir: Path = Path("/home/kirchee/ATLAS/hh_selector/training_data")
     signal_file: str = "ggHH4b-kl1-kt1-c20_tree.root"
     tree_name: str = "Events"
     checkpoint_dir: Path = Path("/home/kirchee/ATLAS/hh_selector/checkpoints")
@@ -71,6 +71,12 @@ class CFG:
         "truerecoj_H2b1_index",
         "truerecoj_H2b2_index",
     )
+    inverted_semiresolved_truth_branches: tuple = (
+        "truerecofj_H2b1_index",
+        "truerecoj_H1b1_index",
+        "truerecoj_H1b2_index",
+    )
+    
     merged_truth_branches: tuple = truth_ak8_branches
     
     higgs_mass: float = 125.0  # gen-level mH target [GeV]
@@ -92,10 +98,10 @@ class CFG:
     #── best-method parameters ─────────────────────────────────────────
     mH1_best_weight = 1
     mH2_best_weight = 1
-    ptH1_best_weight = .8
-    ptH2_best_weight = .8
-    deltaRH1_best_weight = .8
-    deltaRH2_best_weight = .8
+    ptH1_best_weight = .5
+    ptH2_best_weight = .5
+    deltaRH1_best_weight = .2
+    deltaRH2_best_weight = .2
     reco_accuracy_best_weight = 1
     
     best_param_list = {
@@ -113,20 +119,24 @@ class CFG:
     seed: int = 42
     num_workers: int = 4
 
+    # ── inference / chunking parameters ────────────────────────────────────
+    infer_chunk_size: int = 150_000
+    infer_batch_size: int = 4096
+
     # ── sentinel values in ROOT ──────────────────────────────────────────
     reco_sentinel: int = -1000   # algorithm index sentinel
     truth_sentinel: int = -1     # truth-matching index sentinel
 
-    # ── basic sort parameters ──────────────────────────────────────────
-    basic_mH1_weight: float = 1.0
-    basic_mH2_weight: float = 1.0
-    basic_dpt_weight: tuple = (.2 , .2, .2)
-    basic_btag_weight: tuple = (0.0,0.0,0.0)
-    basic_params_list = {
-        'basic_mH1_weight': basic_mH1_weight,
-        'basic_mH2_weight': basic_mH2_weight,
-        'basic_dpt_weight': basic_dpt_weight,
-        'basic_btag_weight' : basic_btag_weight
+    # ── baseline parameters ────────────────────────────────────────────
+    baseline_mH1_weight: float = 1.0
+    baseline_mH2_weight: float = 1.0
+    baseline_dpt_weight: tuple = (.2 , .2, .2)
+    baseline_btag_weight: tuple = (0.0,0.0,0.0)
+    baseline_params_list = {
+        'baseline_mH1_weight': baseline_mH1_weight,
+        'baseline_mH2_weight': baseline_mH2_weight,
+        'baseline_dpt_weight': baseline_dpt_weight,
+        'baseline_btag_weight' : baseline_btag_weight
     }
 
     def __post_init__(self):

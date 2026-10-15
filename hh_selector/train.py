@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -54,10 +55,15 @@ def ranking_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
 # ── training ──────────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, optimizer, device, class_weight=None,
-                    temperature=1.0, mse_weight=0.0):
+                    temperature=1.0, mse_weight=0.0, scaler=None):
     model.train()
     total_loss = 0.0
     n_batches = 0
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda")
+        if "cuda" in device
+        else nullcontext()
+    )
 
     for ak4, ak4_m, ak8, ak8_m, ev, tgt, msk, hg, res_idx, semi_idx, mrg_idx in loader:
         ak4 = ak4.to(device)
@@ -73,12 +79,21 @@ def train_one_epoch(model, loader, optimizer, device, class_weight=None,
         mrg_idx = mrg_idx.to(device)
 
         optimizer.zero_grad()
-        pred = model(ak4, ak4_m, ak8, ak8_m, ev, res_idx, semi_idx, mrg_idx, hg)
-        loss = ranking_loss(pred, tgt, msk, class_weight=class_weight,
-                            temperature=temperature, mse_weight=mse_weight)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        with autocast_ctx:
+            pred = model(ak4, ak4_m, ak8, ak8_m, ev, res_idx, semi_idx, mrg_idx, hg)
+            loss = ranking_loss(pred, tgt, msk, class_weight=class_weight,
+                                temperature=temperature, mse_weight=mse_weight)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -89,6 +104,11 @@ def train_one_epoch(model, loader, optimizer, device, class_weight=None,
 @torch.no_grad()
 def validate(model, loader, device, temperature=1.0, mse_weight=0.0):
     model.eval()
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda")
+        if "cuda" in device
+        else nullcontext()
+    )
     total_loss = 0.0
     n_batches = 0
     for ak4, ak4_m, ak8, ak8_m, ev, tgt, msk, hg, res_idx, semi_idx, mrg_idx in loader:
@@ -104,8 +124,9 @@ def validate(model, loader, device, temperature=1.0, mse_weight=0.0):
         semi_idx = semi_idx.to(device)
         mrg_idx = mrg_idx.to(device)
 
-        pred = model(ak4, ak4_m, ak8, ak8_m, ev, res_idx, semi_idx, mrg_idx, hg)
-        loss = ranking_loss(pred, tgt, msk, temperature=temperature, mse_weight=mse_weight)
+        with autocast_ctx:
+            pred = model(ak4, ak4_m, ak8, ak8_m, ev, res_idx, semi_idx, mrg_idx, hg)
+            loss = ranking_loss(pred, tgt, msk, temperature=temperature, mse_weight=mse_weight)
         total_loss += loss.item()
         n_batches += 1
     return total_loss / n_batches
@@ -142,6 +163,9 @@ def main(cfg: CFG, max_events: int | None = None, device: str | None = None):
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    if "cuda" in device:
+        torch.set_float32_matmul_precision("high")
 
     # ── data ─────────────────────────────────────────────────────────────
     ak4_pad, ak4_mask, ak8_pad, ak8_mask, event_np, targets, mask, higgses, resolved_idx, semi_idx, merged_idx = load_data(cfg, max_events=max_events)
@@ -192,11 +216,15 @@ def main(cfg: CFG, max_events: int | None = None, device: str | None = None):
         dropout=cfg.dropout,
     ).to(device)
 
+    if "cuda" in device:
+        model = torch.compile(model, mode="reduce-overhead")
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=cfg.lr, total_steps=cfg.max_epochs, pct_start=0.3)
+    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
 
     # ── training loop ────────────────────────────────────────────────────
     best_val = float("inf")
@@ -208,7 +236,8 @@ def main(cfg: CFG, max_events: int | None = None, device: str | None = None):
         train_loss = train_one_epoch(model, train_loader, optimizer, device,
                                      class_weight=class_weight,
                                      temperature=cfg.loss_temperature,
-                                     mse_weight=cfg.mse_weight)
+                                     mse_weight=cfg.mse_weight,
+                                     scaler=scaler)
         val_loss = validate(model, val_loader, device,
                             temperature=cfg.loss_temperature,
                             mse_weight=cfg.mse_weight)
