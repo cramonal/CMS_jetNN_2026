@@ -2,14 +2,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+_PKG_DIR = Path(__file__).resolve().parent
+
+
 @dataclass
 class CFG:
     # ── paths ────────────────────────────────────────────────────────────
-    data_dir: Path = Path("/home/kirchee/ATLAS/hh_selector/training_data")
+    data_dir: Path = _PKG_DIR / "training_data"
     signal_file: str = "ggHH4b-kl1-kt1-c20_tree.root"
     tree_name: str = "Events"
-    checkpoint_dir: Path = Path("/home/kirchee/ATLAS/hh_selector/checkpoints")
-    plot_dir: Path = Path("/home/kirchee/ATLAS/hh_selector/plots")
+    checkpoint_dir: Path = _PKG_DIR / "checkpoints"
+    plot_dir: Path = _PKG_DIR / "plots"
 
     # ── jet features ─────────────────────────────────────────────────────
     ak4_features: tuple = ("pt", "eta", "phi", "mass", "bdisc", "btag_M")
