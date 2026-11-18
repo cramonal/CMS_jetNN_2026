@@ -5,6 +5,7 @@ import uproot
 import awkward as ak
 import vector
 from torch.utils.data import Dataset
+import dataclasses
 from .config import CFG
 
 vector.register_awkward()
@@ -30,6 +31,8 @@ def _build_branches(cfg: CFG) -> list[str]:
     # truth-matching indices
     brs += list(cfg.truth_ak4_branches)
     brs += list(cfg.truth_ak8_branches)
+    # b-tag / Xbb branches for the reco availability selection
+    brs += [cfg.ak4_btag_wp_branch, cfg.ak8_xbb_branch]
     # gen-level Higgs masses (used as reference)
     brs += [
         "genp_isHHto4b",
@@ -38,7 +41,7 @@ def _build_branches(cfg: CFG) -> list[str]:
         "genp_H1_FC_eta", "genp_H2_FC_eta",
         "genp_H1_FC_phi", "genp_H2_FC_phi"
     ]
-    return brs
+    return list(dict.fromkeys(brs))  # drop duplicates, keep order
 
 
 # ── 4-vector helpers ─────────────────────────────────────────────────────
@@ -161,6 +164,48 @@ def _semi_truth_helper(arrays,invert:bool,cfg) -> np.ndarray:
         )
         return ok
         
+
+def _assigned_jet_values(arrays, jet_branch: str, idx_branch: str, ok: np.ndarray) -> np.ndarray:
+    """Value of ``jet_branch`` for the jet selected by ``idx_branch``; NaN where ``ok`` is False."""
+    out = np.full(len(arrays), np.nan)
+    if ok.any():
+        sub = arrays[ok]
+        out[ok] = ak.to_numpy(sub[jet_branch][ak.Array(np.arange(len(sub))), sub[idx_branch]])
+    return out
+
+
+def _reco_tag_selection(arrays, method: str, cfg: CFG) -> np.ndarray:
+    """Reco-only minimum selection: topology + algorithm succeeded + every assigned
+    AK4 passes the b-tag WP and every assigned AK8 passes the Xbb cut.
+
+    resolved     : 4 AK4 b-tagged
+    semiresolved : 1 AK8 with Xbb > cut + 2 AK4 b-tagged
+    merged       : 2 AK8 with Xbb > cut
+    """
+    ok = _topology_possible(arrays, method, cfg) & _algo_succeeded(arrays, method, cfg)
+    if method == "resolved":
+        ak4_idx, ak8_idx = cfg.resolved_reco_branches, ()
+    elif method == "semiresolved":
+        ak4_idx, ak8_idx = cfg.semiresolved_reco_branches[1:], cfg.semiresolved_reco_branches[:1]
+    elif method == "merged":
+        ak4_idx, ak8_idx = (), cfg.merged_reco_branches
+    else:
+        raise ValueError(method)
+    for br in ak4_idx:
+        ok &= _assigned_jet_values(arrays, cfg.ak4_btag_wp_branch, br, ok) > 0.5
+    for br in ak8_idx:
+        ok &= _assigned_jet_values(arrays, cfg.ak8_xbb_branch, br, ok) > cfg.ak8_xbb_cut
+    return ok
+
+
+def method_available(arrays, method: str, cfg: CFG) -> np.ndarray:
+    """Which events count this method as a candidate, according to cfg.availability."""
+    if cfg.availability == "reco":
+        return _reco_tag_selection(arrays, method, cfg)
+    return (_topology_possible(arrays, method, cfg)
+            & _algo_succeeded(arrays, method, cfg)
+            & _algo_truth_correct(arrays, method, cfg))
+
 
 def _algo_truth_correct(arrays, method: str, cfg: CFG) -> np.ndarray:
     """Layer 2: did the pairing algorithm produce a valid assignment?"""
@@ -332,8 +377,13 @@ def _reco_accuracy_for_method(arrays, method: str, cfg: CFG):
         N = len(arrays)
         SENTINEL = -1.0
 
-        noninv_avail = _semi_truth_helper(arrays, False, cfg)
-        inv_avail = _semi_truth_helper(arrays, True, cfg)
+        if cfg.availability == "reco":
+            # a gen b without a matched jet (index -1) just never counts as correct,
+            # so both fatjet assignments can be scored for every candidate
+            noninv_avail = inv_avail = np.ones(N, dtype=bool)
+        else:
+            noninv_avail = _semi_truth_helper(arrays, False, cfg)
+            inv_avail = _semi_truth_helper(arrays, True, cfg)
 
         acc_noninv = np.full(N, SENTINEL, dtype=float)
         acc_inv = np.full(N, SENTINEL, dtype=float)
@@ -360,7 +410,7 @@ def _reco_accuracy_for_method(arrays, method: str, cfg: CFG):
             ak4_correct = (reco_b == truth_b).sum(axis=1, keepdims=True).max(axis=2).flatten().astype(float)
             acc_inv[inv_avail] = 0.25 * ak4_correct + 0.5 * ak8_correct
 
-        return np.maximum(acc_noninv, acc_inv)
+        return np.clip(np.maximum(acc_noninv, acc_inv), 0.0, None)
 
     if method == "merged":
         reco = np.array([arrays[recoidx].to_numpy() for recoidx in cfg.merged_reco_branches]).astype(int).T
@@ -496,10 +546,7 @@ def _compute_targets(
     )
 
     for j, method in enumerate(methods):
-        topo = _topology_possible(arrays, method, cfg)
-        algo = _algo_succeeded(arrays, method, cfg)
-        truth = _algo_truth_correct(arrays, method, cfg)
-        avail = topo & algo & truth
+        avail = method_available(arrays, method, cfg)
 
         if not avail.any():
             continue
@@ -541,6 +588,82 @@ def _compute_targets(
         higgses[avail, j, 7] = ak.to_numpy(reco_H2.phi).astype(np.float32)
         higgses[avail, j, 8] = dr
     return targets, errors, mask, higgses
+
+
+# ── cutflow report ────────────────────────────────────────────────────────
+
+def print_cutflow(arrays, cfg: CFG) -> None:
+    """Print events passing each reco selection step per method, the candidate
+    categories (combinations of methods), and how many of each are gen-matched.
+
+    gen-matched   : the gen b's of this topology all have matched reco jets
+                    (truerecoj_* / truerecofj_*, same as _algo_truth_correct)
+    correct jets  : every jet chosen by the reco pairing is the gen-matched one
+    """
+    M = ["resolved", "semiresolved", "merged"]
+    short = {"resolved": "R", "semiresolved": "S", "merged": "M"}
+    N = len(arrays)
+    pct = lambda k, n: f"{100.0 * k / n:5.1f}%" if n else "   - "
+
+    gen = {m: _algo_truth_correct(arrays, m, cfg) for m in M}
+    steps = {m: [] for m in M}
+    cand = {}
+    correct = {}
+    reco_cfg = dataclasses.replace(cfg, availability="reco")  # score both semi assignments
+    for m in M:
+        topo = _topology_possible(arrays, m, cfg)
+        algo = topo & _algo_succeeded(arrays, m, cfg)
+        tag = _reco_tag_selection(arrays, m, cfg)  # includes topo & algo
+        steps[m] = [topo, algo, tag]
+        cand[m] = tag
+        correct[m] = np.zeros(N, dtype=bool)
+        if tag.any():
+            correct[m][tag] = _reco_accuracy_for_method(arrays[tag], m, reco_cfg) >= 1.0 - 1e-6
+
+    w = 30
+    print(f"\n=== Reco selection cutflow  (N = {N} HH->4b events) ===")
+    print(f"{'':30s}" + "".join(f"{m:>{w}s}" for m in M))
+    print(f"{'step':30s}" + "".join(f"{'events (%N) | gen-match':>{w}s}" for _ in M))
+    names = ["jet multiplicity",
+             "+ pairing algorithm",
+             f"+ b-tag M / Xbb>{cfg.ak8_xbb_cut}"]
+    for i, name in enumerate(names):
+        row = f"{name:30s}"
+        for m in M:
+            sel = steps[m][i]
+            n, g = int(sel.sum()), int((sel & gen[m]).sum())
+            row += f"{f'{n} ({pct(n, N)}) | {pct(g, n)}':>{w}s}"
+        print(row)
+    row = f"{'  of which correct jets':30s}"
+    for m in M:
+        n, c = int(cand[m].sum()), int(correct[m].sum())
+        row += f"{f'{c} | {pct(c, n)}':>{w}s}"
+    print(row)
+
+    # ── categories: which combination of methods passes the reco selection ──
+    code = sum(cand[m].astype(int) << i for i, m in enumerate(M))
+    print(f"\n=== Candidate categories after reco selection ===")
+    print(f"{'category':12s}{'events':>9s}{'%N':>8s}{'≥1 gen':>9s}"
+          + "".join(f"{short[m] + ' gen':>9s}" for m in M) + f"{'none gen':>10s}")
+    tot = {"n": 0}
+    for c in range(8):
+        sel = code == c
+        n = int(sel.sum())
+        members = [m for i, m in enumerate(M) if c >> i & 1]
+        label = "+".join(short[m] for m in members) or "none"
+        any_gen = np.zeros(N, dtype=bool)
+        for m in members:
+            any_gen |= gen[m]
+        cells = "".join(
+            f"{(pct(int((sel & gen[m]).sum()), n) if m in members else '-'):>9s}" for m in M)
+        g = int((sel & any_gen).sum()) if members else 0
+        print(f"{label:12s}{n:>9d}{pct(n, N):>8s}{(pct(g, n) if members else '-'):>9s}{cells}"
+              f"{(pct(n - g, n) if members else '-'):>10s}")
+    multi = code.astype(np.int64)
+    n2 = int((np.array([bin(x).count('1') for x in range(8)])[multi] >= 2).sum())
+    print(f"events with ≥2 candidates: {n2} ({pct(n2, N)})")
+    print("(gen-match: the topology's gen b's all have matched reco jets; "
+          "% in gen columns are relative to the row's events)\n")
 
 
 # ── data loading ──────────────────────────────────────────────────────────
@@ -624,9 +747,13 @@ def load_data(cfg: CFG, max_events: int | None = None):
         ak.to_numpy(arrays["mergedHH_H2_index"]),      # ak8
     ], axis=-1).astype(np.int64)  # (N, 2) — indices into ak8 jets
 
+    # ── cutflow report ───────────────────────────────────────────────────
+    print_cutflow(arrays, cfg)
+
     # ── targets ──────────────────────────────────────────────────────────
     targets, errors, mask, higgses = _compute_targets(ak4_4vec, ak8_4vec, arrays, cfg)
-    print(f"  events with ≥1 valid method (topo+algo+truth): {(mask.any(axis=1)).sum()}")
+    print(f"  availability mode: {cfg.availability}")
+    print(f"  events with ≥1 valid method: {(mask.any(axis=1)).sum()}")
     print(f"  valid methods — resolved: {mask[:,0].sum()}, semi: {mask[:,1].sum()}, merged: {mask[:,2].sum()}")
 
     # keep only events where at least 2 methods are available

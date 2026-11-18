@@ -163,6 +163,8 @@ def main(cfg: CFG, max_events: int | None = None, device: str | None = None):
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Availability: {cfg.availability}   outputs: {cfg.checkpoint_dir}, {cfg.plot_dir}")
+    print(f"Target error weights: {cfg.best_param_list}")
 
     if "cuda" in device:
         torch.set_float32_matmul_precision("high")
@@ -255,6 +257,7 @@ def main(cfg: CFG, max_events: int | None = None, device: str | None = None):
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "val_loss": val_loss,
+                "availability": cfg.availability,
             }, ckpt)
             print(f"  → saved checkpoint ({ckpt})")
         else:
@@ -269,8 +272,17 @@ def main(cfg: CFG, max_events: int | None = None, device: str | None = None):
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "val_loss": val_loss,
+        "availability": cfg.availability,
     }, final_ckpt)
     print(f"Training complete. Best val loss: {best_val:.6f}")
+
+    # ── evaluate best checkpoint on the held-out test split ──────────────
+    from .evaluate import evaluate_dataset, load_model as load_eval_model
+    print("\nEvaluating best checkpoint on the test split...")
+    best_model = load_eval_model(cfg.checkpoint_dir / "best.pt", cfg, device)
+    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
+                             num_workers=cfg.num_workers)
+    evaluate_dataset(best_model, test_loader, cfg, device, tag="test")
 
     return model, test_ds
 
@@ -282,9 +294,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--availability", type=str, default=CFG.availability, choices=["truth", "reco"],
+                        help="Method availability: truth-matched (gen) or reco b-tag/Xbb selection")
     args = parser.parse_args()
 
     cfg = CFG()
+    cfg.set_availability(args.availability)
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
     if args.lr is not None:

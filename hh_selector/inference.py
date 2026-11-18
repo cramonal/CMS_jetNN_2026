@@ -18,7 +18,7 @@ import torch
 
 from .config import CFG
 from .model import HHSelector
-from .dataset import _topology_possible, _algo_succeeded, compute_higgses
+from .dataset import _topology_possible, _algo_succeeded, _reco_tag_selection, compute_higgses
 
 
 __all__ = ["InferenceResult", "apply_model", "load_model"]
@@ -56,7 +56,9 @@ def _required_branches(cfg: CFG) -> list[str]:
     brs += list(cfg.resolved_reco_branches)
     brs += list(cfg.semiresolved_reco_branches)
     brs += list(cfg.merged_reco_branches)
-    return brs
+    if cfg.availability == "reco":
+        brs += [cfg.ak4_btag_wp_branch, cfg.ak8_xbb_branch]
+    return list(dict.fromkeys(brs))
 
 
 def _validate_branches(arrays: ak.Array, cfg: CFG) -> list[str]:
@@ -88,9 +90,13 @@ def _prepare_arrays(arrays: ak.Array, cfg: CFG):
         algo_cache[method] = _algo_succeeded(arrays, method, cfg)
 
     # ── method availability (reco-level only, NO truth) ──────────
+    # "reco" models were trained with the b-tag / Xbb selection on top
     method_mask = np.zeros((len(arrays), 3), dtype=bool)
     for j, method in enumerate(METHODS):
-        method_mask[:, j] = topo_cache[method] & algo_cache[method]
+        if cfg.availability == "reco":
+            method_mask[:, j] = _reco_tag_selection(arrays, method, cfg)
+        else:
+            method_mask[:, j] = topo_cache[method] & algo_cache[method]
 
     event_valid = method_mask.any(axis=1)
     event_indices = np.where(event_valid)[0]
@@ -187,6 +193,12 @@ def load_model(checkpoint_path: str | Path, cfg: CFG,
         dropout=cfg.dropout,
     )
     state = torch.load(checkpoint_path, map_location=device)
+    # the availability definition is part of the model: sync cfg so the
+    # method mask built afterwards (_prepare_arrays) matches training
+    ckpt_mode = state.get("availability", "truth")
+    if ckpt_mode != cfg.availability:
+        print(f"Using availability='{ckpt_mode}' from checkpoint")
+        cfg.availability = ckpt_mode
     sd = state["model_state_dict"]
     if any(k.startswith("_orig_mod.") for k in sd):
         sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
@@ -248,6 +260,12 @@ def apply_model(
         cfg = CFG()
 
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ── availability mode is a property of the trained model ────────
+    ckpt_mode = torch.load(checkpoint_path, map_location="cpu").get("availability", "truth")
+    if ckpt_mode != cfg.availability:
+        print(f"Using availability='{ckpt_mode}' from checkpoint")
+        cfg.availability = ckpt_mode
 
     # ── validate branches ────────────────────────────────────────────
     missing = _validate_branches(arrays, cfg)
